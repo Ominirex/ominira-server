@@ -17,7 +17,6 @@ use tokio;
 use warp::Filter;
 use serde_json::json;
 use sha3::{Keccak256};
-use num_traits::Num;
 use eyre::anyhow;
 use std::thread;
 use serde_json::Value;
@@ -41,7 +40,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, AsyncBufReadExt};
 use dashmap::DashMap;
 use uuid::Uuid;
 use tokio::sync::{Mutex as tMutex};
-use num_traits::{One, Zero, ToPrimitive};
 use std::io::{BufReader as iBufReader, Write as iWrite};
 use std::net::{TcpListener as nTcpListener, TcpStream as nTcpStream};
 use blake3;
@@ -81,8 +79,8 @@ static HOST: &str = "0.0.0.0";
 static PORT: u16 = 9876;
 
 pub fn start_local_hash_server() -> std::io::Result<()> {
-    let listener = nTcpListener::bind("127.0.0.1:6789")?;
-	print_log_message(format!("RandomX hash server listening on 127.0.0.1:6789"), 1);
+    let listener = nTcpListener::bind("127.0.0.1:16789")?;
+	print_log_message(format!("RandomX hash server listening on 127.0.0.1:16789"), 1);
 
     for stream in listener.incoming() {
         match stream {
@@ -351,7 +349,7 @@ pub async fn handle_connection(mut socket: TcpStream, state: SharedState) -> Res
 								
 								let mut hashdiff = 0;
 
-								if let Ok(mut stream) = nTcpStream::connect("127.0.0.1:6789") {
+								if let Ok(mut stream) = nTcpStream::connect("127.0.0.1:16789") {
 									let request = json!({
 										"blob": &job_state.blob,
 										"nonce": nonce
@@ -651,7 +649,7 @@ async fn main() -> sled::Result<()> {
 
 	sleep(tDuration::from_millis(1300));
 
-	if let Ok(mut stream) = nTcpStream::connect("127.0.0.1:6789") {
+	if let Ok(mut stream) = nTcpStream::connect("127.0.0.1:16789") {
 		let request = json!({
 			"blob": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
 			"nonce": "11111111"
@@ -745,8 +743,8 @@ async fn main() -> sled::Result<()> {
 	
 	let servers = vec![
 		"node1.ominirex.xyz".to_string(),
-		"node2.ominirex.xyz".to_string()
-		"omi.pokio.xyz".to_string()
+		"node2.ominirex.xyz".to_string(),
+		"omi.pokio.xyz".to_string(),
 	];
 	
 	//-- sync at start

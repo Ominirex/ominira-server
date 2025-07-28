@@ -5,24 +5,17 @@ use pqcrypto_sphincsplus::sphincssha2128fsimple::{
 use pqcrypto_traits::sign::{PublicKey as PublicKeyTrait, SecretKey as SecretKeyTrait };
 use pqcrypto_traits::sign::DetachedSignature as DetachedSignatureTrait;
 use hex::decode;
+use num_traits::identities::Zero;
+use num_traits::ToPrimitive;
+use num_traits::Num;
 use serde::{Serialize, Deserialize};
 use tiny_keccak::{Hasher, Keccak};
 use sha2::{Sha256, Digest};
-use hex;
-use ethers::prelude::*;
-use ethers::types::{Transaction, TransactionRequest};
-use ethers::types::transaction::eip2718::TypedTransaction;
-use eyre::Result;
-use rlp;
 use num_bigint::BigUint;
 use num_bigint::BigInt;
-use ethereum_types::{H160, H256, U256};
-use ethers::types::U256 as EthersU256;
-use secp256k1::{Secp256k1, Message, ecdsa::{RecoverableSignature, RecoveryId}};
+use hex;
+use eyre::Result;
 use sha3::{Keccak256};
-use num_traits::Num;
-use rlp::RlpStream;
-use num_traits::Zero;
 use std::cmp::max; 
 use eyre::anyhow;
 use std::str::FromStr;
@@ -36,7 +29,6 @@ use chrono::Local;
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use once_cell::sync::Lazy;
-use num_traits::ToPrimitive;
 use std::io::{BufReader as iBufReader, Write as iWrite};
 use std::net::{TcpListener as nTcpListener, TcpStream as nTcpStream};
 use std::io::BufRead;
@@ -159,12 +151,12 @@ pub fn calculate_reward(height: u64) -> u64 {
 
 pub fn calculate_rx_diff(height: u64) -> u64 {
 	if height <= 16 {
-		1000
+		10000
 	} else {
-		let expectedtime: u64 = 16 * 30;
-		let Some((blocktime, totaldiff)) = get_block_range_analysis(height-1) else { return 10000 };
+		let expectedtime: u64 = 16 * 240;
+		let Some((blocktime, totaldiff)) = get_block_range_analysis(height-1) else { return 2400000 };
 		let x = (expectedtime * totaldiff) / blocktime / 16;
-		max(1000, x)
+		max(24000, x)
 	}
 }
 
@@ -189,121 +181,6 @@ pub fn set_latest_block_info() {
 	config::update_actual_height(0);
 	config::update_actual_hash("0000000000000000000000000000000000000000000000000000000000000000".to_string());
 	config::update_actual_timestamp(0);
-}
-
-fn recover_sender_address(v: u8, r: &str, s: &str, message_hash: [u8; 32]) -> Result<H160, String> {
-	let secp = Secp256k1::new();
-
-	let recovery_id = RecoveryId::from_i32(v as i32).map_err(|e| e.to_string())?;
-
-	let r_bigint = BigInt::from_str_radix(r, 16).map_err(|e| e.to_string())?;
-	let s_bigint = BigInt::from_str_radix(s, 16).map_err(|e| e.to_string())?;
-
-	let mut r_bytes = [0u8; 32];
-	let mut s_bytes = [0u8; 32];
-
-	let r_bytes_raw = r_bigint.to_bytes_be().1;
-	let s_bytes_raw = s_bigint.to_bytes_be().1;
-
-	r_bytes[32 - r_bytes_raw.len()..].copy_from_slice(&r_bytes_raw);
-	s_bytes[32 - s_bytes_raw.len()..].copy_from_slice(&s_bytes_raw);
-
-	let mut signature_bytes = [0u8; 64];
-	signature_bytes[..32].copy_from_slice(&r_bytes);
-	signature_bytes[32..].copy_from_slice(&s_bytes);
-
-	let signature = RecoverableSignature::from_compact(&signature_bytes, recovery_id)
-		.map_err(|e| e.to_string())?;
-
-	let message = Message::from_slice(&message_hash).map_err(|e| e.to_string())?;
-	let public_key = secp.recover_ecdsa(&message, &signature).map_err(|e| e.to_string())?;
-
-	let public_key_bytes = public_key.serialize_uncompressed();
-	let address_bytes = Keccak256::digest(&public_key_bytes[1..]);
-	let address = H160::from_slice(&address_bytes[12..]);
-
-	Ok(address)
-}
-
-fn calculate_message_hash(
-	nonce: U256,
-	gas_price: U256,
-	gas: U256,
-	to: H160,
-	value: U256,
-	input: &[u8],
-	chain_id: u64,
-) -> H256 {
-	let mut rlp_stream = RlpStream::new();
-	rlp_stream.begin_list(9);
-	rlp_stream.append(&nonce);
-	rlp_stream.append(&gas_price);
-	rlp_stream.append(&gas);
-	rlp_stream.append(&to);
-	rlp_stream.append(&value);
-	rlp_stream.append(&input);
-	rlp_stream.append(&chain_id);
-	rlp_stream.append(&0u8);
-	rlp_stream.append(&0u8);
-
-	let rlp_encoded = rlp_stream.out();
-	let hash = Keccak256::digest(&rlp_encoded);
-	H256::from_slice(&hash)
-}
-
-pub fn decode_transaction(raw_tx_hex: &str) -> Result<Transaction> {
-	let raw_tx_bytes = hex::decode(raw_tx_hex.strip_prefix("0x").unwrap_or(raw_tx_hex))?;
-	let mut tx: Transaction = rlp::decode(&raw_tx_bytes)?;
-	
-	let mut bytes = [0u8; 32];
-	tx.nonce.to_little_endian(&mut bytes);
-	let nonce = U256::from_little_endian(&bytes);
-	
-	let mut gpbytes = [0u8; 32];
-	let gas_price_value = tx.gas_price.unwrap_or(EthersU256::zero());
-	gas_price_value.to_little_endian(&mut gpbytes);
-	let gas_price = U256::from_little_endian(&gpbytes);
-	
-	let mut gbytes = [0u8; 32];
-	tx.gas.to_little_endian(&mut gbytes);
-	let gas = U256::from_little_endian(&gbytes);
-	
-	let mut valbytes = [0u8; 32];
-	tx.value.to_little_endian(&mut valbytes);
-	let value = U256::from_little_endian(&valbytes);
-	
-	let input = tx.input.clone();
-	let dest_str = tx.to.map(|addr| format!("{:x}", addr)).unwrap_or_default();
-	let to = H160::from_slice(&hex::decode(dest_str).unwrap());
-	let chain_id = tx.chain_id.unwrap_or(EthersU256::zero()).as_u64();
-
-	let message_hash = calculate_message_hash(nonce, gas_price, gas, to, value, &input, chain_id);
-
-	let v: U64 = tx.v;
-	let r = tx.r.to_string();
-	let s = tx.s.to_string();
-	let r_bigint = BigInt::from_str_radix(&r, 10).unwrap();
-	let s_bigint = BigInt::from_str_radix(&s, 10).unwrap();
-	let r_hex = format!("{:064x}", r_bigint);
-	let s_hex = format!("{:064x}", s_bigint);
-
-	let adjusted_v = (v.as_u64() - (2 * chain_id + 35)) as u8;
-
-	if adjusted_v > 1 {
-		print_log_message(format!("Invalid adjusted `v` value: {}", adjusted_v), 4);
-		return Err(anyhow!("Invalid adjusted v value"));
-	}
-
-	match recover_sender_address(adjusted_v, &r_hex, &s_hex, message_hash.into()) {
-		Ok(address) => {
-			tx.from = ethers::types::H160::from_slice(address.as_bytes());
-			Ok(tx)
-		},
-		Err(e) => {
-			print_log_message(format!("Error: {}", e), 4);
-			Err(anyhow!("Failed to recover sender address"))
-		}
-	}
 }
 
 pub fn generate_reward_tx(nonce: &str, miner_address: &str, reward_amount: u64) -> eyre::Result<String> {
@@ -811,7 +688,7 @@ pub fn save_block_to_db(new_block: &mut Block, checkpoint: u8) -> Result<(), Box
 						}
 					};
 					let mut rx_hashdiff = 0;
-					if let Ok(mut stream) = nTcpStream::connect("127.0.0.1:6789") {
+					if let Ok(mut stream) = nTcpStream::connect("127.0.0.1:16789") {
 						let request = json!({
 							"blob": &rx_blob, 
 							"nonce": &new_block.nonce,
