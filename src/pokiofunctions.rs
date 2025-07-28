@@ -148,7 +148,7 @@ pub fn calculate_reward(height: u64) -> u64 {
 }
 
 pub fn calculate_rx_diff(height: u64) -> u64 {
-	if height <= 16 {
+	if height <= 17 {
 		10000
 	} else {
 		let expectedtime: u64 = 16 * 240;
@@ -361,7 +361,7 @@ pub fn check_integrity() -> Option<Block> {
 
 pub fn get_block_range_analysis(height: u64) -> Option<(u64, u64)> {
 	let db = config::db();
-	if height < 16 {
+	if height <= 16 {
 		return None;
 	}
 	let (start, end) = (height - 16, height);
