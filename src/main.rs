@@ -526,6 +526,9 @@ fn mine_block(coins: &str, miner: &str, nonce: &str, id: &str, extra_data: &str)
 		} else {
 			valid_timestamp = pre_timestamp;
 		}
+		
+		let block_reward = calculate_reward(actual_height + 1);
+		
 		let mut new_block = Block {
 			height: actual_height + 1,
 			hash: "".to_string(),
@@ -534,11 +537,9 @@ fn mine_block(coins: &str, miner: &str, nonce: &str, id: &str, extra_data: &str)
 			nonce: nonce.to_string(),
 			//transactions: vec!["tx1".to_string(), "tx2".to_string()],
 			transactions: block_transactions.to_string(),
-			gas_limit: 1000000,
-			gas_used: 750000,
 			miner: miner.to_string(),
 			difficulty: block_difficulty,
-			block_reward: 100000000,
+			block_reward: block_reward,
 			state_root: "".to_string(),
 			receipts_root: "".to_string(),
 			logs_bloom: "".to_string(),
@@ -1077,8 +1078,6 @@ async fn main() -> sled::Result<()> {
 										timestamp: block_json.get("timestamp").and_then(|v| v.as_u64()).expect("Missing timestamp"),
 										nonce: block_json.get("nonce").and_then(|v| v.as_str()).map_or_else(|| "0000000000000000".to_string(), String::from),
 										transactions: block_json.get("transactions").and_then(|v| v.as_str()).map_or_else(|| "".to_string(), String::from),
-										gas_limit: block_json.get("gas_limit").and_then(|v| v.as_u64()).expect("Missing gas_limit"),
-										gas_used: block_json.get("gas_used").and_then(|v| v.as_u64()).expect("Missing gas_used"),
 										miner: block_json.get("miner").and_then(|v| v.as_str()).map_or_else(|| "".to_string(), String::from),
 										difficulty: block_json.get("difficulty").and_then(|v| v.as_u64()).expect("Missing difficulty"),
 										block_reward: block_json.get("block_reward").and_then(|v| v.as_u64()).expect("Missing block_reward"),
@@ -1150,8 +1149,6 @@ async fn full_sync_blocks(pserver: String) -> Result<(), Box<dyn std::error::Err
 						timestamp: first_block.get("timestamp").and_then(|v| v.as_u64()).expect("REASON"),
 						nonce: first_block.get("nonce").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| String::from("0000000000000000")),
 						transactions: first_block.get("transactions").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| String::from("")),
-						gas_limit: first_block.get("gas_limit").and_then(|v| v.as_u64()).expect("REASON"),
-						gas_used: first_block.get("gas_used").and_then(|v| v.as_u64()).expect("REASON"),
 						miner: first_block.get("miner").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| String::from("")),
 						difficulty: first_block.get("difficulty").and_then(|v| v.as_u64()).expect("REASON"),
 						block_reward: first_block.get("block_reward").and_then(|v| v.as_u64()).expect("REASON"),

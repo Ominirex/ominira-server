@@ -69,8 +69,6 @@ pub struct Block {
 	pub nonce: String,
 	pub transactions: String,
 	// pub transactions: Vec<String>,
-	pub gas_limit: u64,
-	pub gas_used: u64,
 	pub miner: String,
 	pub difficulty: u64,
 	pub block_reward: u64,
