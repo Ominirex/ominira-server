@@ -21,17 +21,17 @@ pub fn start_nng_server(ips: Vec<String>) {
 		rt.block_on(async {
 			let client = reqwest::Client::new();
 			let socket = Socket::new(Protocol::Pub0).expect("Can't launch NNG socket");
-			socket.listen("tcp://0.0.0.0:5555").expect("Error opening NNG port (5555)");
+			socket.listen("tcp://0.0.0.0:9999").expect("Error opening NNG port (9999)");
 			let mut s_height = 0;
 
 			let mining_urls: Vec<String> = ips
 				.iter()
-				.map(|ip| format!("http://{}:30303/mining", ip))
+				.map(|ip| format!("http://{}:40404/mining", ip))
 				.collect();
 
 			let rpc_urls: Vec<String> = ips
 				.iter()
-				.map(|ip| format!("http://{}:30303/rpc", ip))
+				.map(|ip| format!("http://{}:40404/rpc", ip))
 				.collect();
 
 			let mut ticker = interval(tDuration::from_millis(25));
@@ -52,22 +52,7 @@ pub fn start_nng_server(ips: Vec<String>) {
 						if let Some(block_data) = db.get(block_key).expect("Failed to get block") {
 							let block: Block = bincode::deserialize(&block_data).expect("Failed to deserialize block");
 							let transactions: Vec<&str> = block.transactions.split('-').collect();
-							let mut own_block: u64 = 0;
-							if let Some(&tx_str) = transactions.get(0) {
-								match decode_transaction(tx_str) {
-									Ok(tx) => {
-										let signer_address = format!("0x{}", hex::encode(tx.from));
-										let own_address = format!("0x{}", ethers::utils::hex::encode(config::address()));
-										if signer_address == own_address {
-											own_block = 1;
-										}
-									}
-									Err(e) => {
-										eprintln!("Error processing tx: {:?}", e);
-										continue;
-									}
-								}
-							}
+							let own_block: u64 = 1;
 
 							if own_block == 1 {
 								let block_json = serde_json::to_string(&block).expect("Failed to serialize block to JSON");
@@ -181,7 +166,7 @@ pub fn connect_to_nng_server(pserver: String) -> Result<(), Box<dyn std::error::
 		.timeout(Duration::from_secs(2))
 		.build()
 		.expect("Failed to build HTTP client");
-	let rpc_url = format!("http://{}:30303/rpc", pserver);
+	let rpc_url = format!("http://{}:40404/rpc", pserver);
 	let db = config::db();
 	let mempooldb = config::mempooldb();
 
@@ -193,7 +178,7 @@ pub fn connect_to_nng_server(pserver: String) -> Result<(), Box<dyn std::error::
 				ticker.tick().await;
 				let socket = Socket::new(Protocol::Sub0).expect("Can't create NNG connection");
 				let _ = socket.set_opt::<Subscribe>(vec![]);
-				let nng_url = format!("tcp://{}:5555", pserver);
+				let nng_url = format!("tcp://{}:9999", pserver);
 				if socket.dial(&nng_url).is_err() {
 					print_log_message(format!("Can't connect to NNG server"), 3);
 				}
@@ -329,7 +314,7 @@ pub fn connect_to_http_server(pserver: String) -> Result<(), Box<dyn std::error:
 				if config::full_sync_status() == 0 {
 					if last_mempool_check.elapsed() >= Duration::from_secs(5) {
 						last_mempool_check = Instant::now();
-						let rpc_url = format!("http://{}:30303/rpc", pserver);
+						let rpc_url = format!("http://{}:40404/rpc", pserver);
 						if let Ok(response) = client
 							.post(rpc_url)
 							.json(&json!({
@@ -361,7 +346,7 @@ pub fn connect_to_http_server(pserver: String) -> Result<(), Box<dyn std::error:
 					}
 					
 					let (actual_height, _actual_hash, _) = get_latest_block_info();
-					let x_rpc_url = format!("http://{}:30303/rpc", pserver);
+					let x_rpc_url = format!("http://{}:40404/rpc", pserver);
 					let blocks_response = match client
 						.post(x_rpc_url)
 						.json(&json!({
@@ -425,7 +410,7 @@ pub fn connect_to_http_server(pserver: String) -> Result<(), Box<dyn std::error:
 				
 				if config::full_sync_status() == 0 {
 					let (actual_height, block_hash, _) = get_latest_block_info();
-					let x_rpc_url = format!("http://{}:30303/rpc", pserver);
+					let x_rpc_url = format!("http://{}:40404/rpc", pserver);
 					let request_body = json!({
 						"jsonrpc": "2.0",
 						"id": 1,

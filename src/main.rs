@@ -1,28 +1,23 @@
+use pqcrypto_sphincsplus::sphincssha2128fsimple::{
+    keypair, detached_sign, verify_detached_signature,
+    PublicKey, SecretKey, DetachedSignature
+};
+use pqcrypto_traits::sign::{PublicKey as PublicKeyTrait, SecretKey as SecretKeyTrait };
+use pqcrypto_traits::sign::DetachedSignature as DetachedSignatureTrait;
 use sled;
 use serde::{Serialize, Deserialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tiny_keccak::{Hasher, Keccak};
 use sha2::{Sha256, Digest};
 use hex;
-use ethers::prelude::*;
-use ethers::types::{Transaction, TransactionRequest};
-use ethers::types::transaction::eip2718::TypedTransaction;
 use std::str::FromStr;
 use eyre::Result;
-use rlp;
 use futures::future::join_all;
-use num_bigint::BigUint;
-use num_bigint::BigInt;
-use num_bigint::ToBigUint;
 use tokio;
 use warp::Filter;
 use serde_json::json;
-use ethereum_types::{H160, H256, U256};
-use ethers::types::U256 as EthersU256;
-use secp256k1::{Secp256k1, Message, ecdsa::{RecoverableSignature, RecoveryId}};
 use sha3::{Keccak256};
 use num_traits::Num;
-use rlp::RlpStream;
 use eyre::anyhow;
 use std::thread;
 use serde_json::Value;
@@ -49,23 +44,18 @@ use tokio::sync::{Mutex as tMutex};
 use num_traits::{One, Zero, ToPrimitive};
 use std::io::{BufReader as iBufReader, Write as iWrite};
 use std::net::{TcpListener as nTcpListener, TcpStream as nTcpStream};
+use blake3;
 
 mod config;
 mod constants;
 use constants::*;
-mod pokiohash;
-use pokiohash::*;
 mod pokiofunctions;
 use pokiofunctions::*;
 use pokiofunctions::{MinerInfo, Block};
 mod merkle;
 use merkle::*;
-mod balances;
-use balances::*;
 mod nngutils;
 use nngutils::*;
-mod virtualmachine;
-use virtualmachine::*;
 
 use randomx_rs::{RandomXCache, RandomXVM, RandomXFlag};
 use hex::decode;
@@ -88,7 +78,7 @@ pub struct JobState {
 type SharedState = Arc<DashMap<String, JobState>>;
 
 static HOST: &str = "0.0.0.0";
-static PORT: u16 = 3333;
+static PORT: u16 = 9876;
 
 pub fn start_local_hash_server() -> std::io::Result<()> {
     let listener = nTcpListener::bind("127.0.0.1:6789")?;
@@ -173,43 +163,26 @@ pub async fn broadcast_new_job(state: &SharedState, height: u64, hash: String, t
     use tokio::io::AsyncWriteExt;
 
     let ts_hex = format!("{:010x}", ts);
-    let nonce = MINING_TX_NONCE + height + 1;
-    let signer = format!("0x{}", ethers::utils::hex::encode(config::address()));
-    let base_wei = BigUint::parse_bytes(b"1000000000000000000", 10).unwrap();
-    let fee_base_wei = BigUint::parse_bytes(b"10000000000000000", 10).unwrap();
-    let fee: u64 = config::mining_fee().try_into().unwrap();
-
+    let nonce = "0000";
     for mut entry in state.iter_mut() {
         let job_state = entry.value_mut();
-        let coins = job_state.coins;
 		let (ah, _, _) = get_latest_block_info();
-		let extra_data: String;
-		if ah > EXTRA_NONCE_HEIGHT {
-			extra_data = job_state.worker_id.replace("-", "")[..4].to_lowercase();
-		} else {
-			extra_data = "0101".to_string();
-		}
+		let extra_data = job_state.worker_id.replace("-", "")[..4].to_lowercase();
 		
-        let difficulty = calculate_rx_diff(coins, ah);
+        let difficulty = calculate_rx_diff(ah + 1);
         let target = difficulty_to_target(difficulty);
         let job_id = Uuid::new_v4().to_string();
 
-        let fee_wei_amount = BigUint::from(coins) * &fee_base_wei * fee;
-        let fee_reward_amount = EthersU256::from_dec_str(&fee_wei_amount.to_str_radix(10)).unwrap();
-        let wei_amount = BigUint::from(coins) * &base_wei - &fee_wei_amount;
-        let reward_amount = EthersU256::from_dec_str(&wei_amount.to_str_radix(10)).unwrap();
-
-        let raw_tx = generate_reward_tx(config::pkey(), nonce, &job_state.miner, reward_amount).unwrap_or_default();
-        let fee_raw_tx = generate_reward_tx(config::pkey(), nonce, &signer, fee_reward_amount).unwrap_or_default();
+		let reward_amount = calculate_reward(height + 1);
+        let raw_tx = generate_reward_tx(nonce, &job_state.miner, reward_amount).unwrap_or_default();
 
         let blob = format!(
-            "{}{}{}0000000001{}{}0000000000000000{}",
+            "{}{}{}0000000001{}{}",
 			extra_data,
             ts_hex,
             hash,
             target,
-            raw_tx,
-            fee_raw_tx
+            raw_tx
         );
 
         job_state.job_id = job_id.clone();
@@ -277,29 +250,8 @@ pub async fn handle_connection(mut socket: TcpStream, state: SharedState) -> Res
 							.and_then(|p| p.get("login"))
 							.and_then(|l| l.as_str())
 							.unwrap_or("");
-						let is_valid_wallet = login_str.len() == 42
-							&& login_str.starts_with("0x")
+						let is_valid_wallet = login_str.len() == 64
 							&& login_str.chars().skip(2).all(|c| c.is_ascii_hexdigit());
-						let pcoins = msg.get("params")
-							.and_then(|p| p.get("coins"))
-							.and_then(|c| c.as_u64())
-							.unwrap_or(0);
-						
-						if pcoins < 30 {
-							let response = json!({
-								"id": msg.get("id").cloned().unwrap_or(json!(1)),
-								"jsonrpc": "2.0",
-								"error": {
-									"code": -1,
-									"message": "invalid miner: download pokio-xmrig"
-								}
-							});
-
-							let response_text = serde_json::to_string(&response)? + "\n";
-							let mut writer_lock = writer.lock().await;
-							writer_lock.write_all(response_text.as_bytes()).await?;
-							continue;
-						}
 
 						if !is_valid_wallet {
 							let response = json!({
@@ -319,35 +271,18 @@ pub async fn handle_connection(mut socket: TcpStream, state: SharedState) -> Res
 						let (actual_height, actual_hash, actual_ts) = get_latest_block_info();
 						let worker_uuid = Uuid::new_v4();
 						let worker_id = worker_uuid.to_string();
-						let extra_data: String;
-						if actual_height > EXTRA_NONCE_HEIGHT {
-							extra_data = worker_id.replace("-", "")[..4].to_lowercase();
-						} else {
-							extra_data = "0101".to_string();
-						}
+						let extra_data = worker_id.replace("-", "")[..4].to_lowercase();
 
 						let job_id = Uuid::new_v4().to_string();
 						let coins = 50;
-						let difficulty: u64 = calculate_rx_diff(coins, actual_height);
+						let difficulty: u64 = calculate_rx_diff(actual_height + 1);
 						let target = difficulty_to_target(difficulty);
 						let ts_hex = format!("{:010x}", actual_ts);
 						//let diff_dec = calculate_diff(coins_dec, height.clone());
-						let nonce = MINING_TX_NONCE + actual_height + 1;
-						let fee: u64 = config::mining_fee().try_into().unwrap();;
-						let _fee_biguint = BigUint::from(fee);
-						let fee_base_wei = BigUint::parse_bytes(b"10000000000000000", 10).unwrap();
-						let fee_coins_biguint = BigUint::from(coins);
-						let fee_wei_amount = fee_coins_biguint * &fee_base_wei * fee;
-						let fee_reward_amount = EthersU256::from_dec_str(&fee_wei_amount.to_str_radix(10)).unwrap();
-						let fee_raw_tx: String;
-						let signer: String;
-						signer = format!("0x{}", ethers::utils::hex::encode(config::address()));
-						let base_wei = BigUint::parse_bytes(b"1000000000000000000", 10).unwrap();
-						let coins_biguint = BigUint::from(coins);
-						let wei_amount = (coins_biguint * &base_wei) - fee_wei_amount;
-						let reward_amount = EthersU256::from_dec_str(&wei_amount.to_str_radix(10)).unwrap();
-						let raw_tx: String;
-						match generate_reward_tx(config::pkey(), nonce, login_str, reward_amount) {
+						let nonce = "0000";
+						let reward_amount = calculate_reward(actual_height + 1);
+						let raw_tx;
+						match generate_reward_tx(nonce, login_str, reward_amount) {
 							Ok(tx) => {
 								raw_tx = tx;
 							}
@@ -355,23 +290,14 @@ pub async fn handle_connection(mut socket: TcpStream, state: SharedState) -> Res
 								raw_tx = String::new();
 							}
 						}
-						match generate_reward_tx(config::pkey(), nonce, &signer, fee_reward_amount) {
-							Ok(tx) => {
-								fee_raw_tx = tx;
-							}
-							Err(_e) => {
-								fee_raw_tx = String::new();
-							}
-						}
 						
 						let blob = format!(
-							"{}{}{}0000000001{}{}0000000000000000{}",
+							"{}{}{}0000000001{}{}",
 							extra_data,
 							ts_hex,
 							actual_hash,
 							target,
-							raw_tx,
-							fee_raw_tx
+							raw_tx
 						);
 
 						state.insert(worker_id.clone(), JobState {
@@ -468,12 +394,8 @@ pub async fn handle_connection(mut socket: TcpStream, state: SharedState) -> Res
 										let mut writer = job_state.writer.lock().await;
 										writer.write_all(response_text.as_bytes()).await?;
 										let (actual_height, _actual_hash, _actual_ts) = get_latest_block_info();
-										if actual_height > EXTRA_NONCE_HEIGHT {
-											let extra_data = job_state.worker_id.replace("-", "")[..4].to_lowercase();
-											let _ = mine_block(&job_state.coins.to_string(), &job_state.miner, nonce, worker_id, 2, &extra_data);
-										} else {
-											let _ = mine_block(&job_state.coins.to_string(), &job_state.miner, nonce, worker_id, 2, "");
-										}
+										let extra_data = job_state.worker_id.replace("-", "")[..4].to_lowercase();
+										let _ = mine_block(&job_state.coins.to_string(), &job_state.miner, nonce, worker_id, &extra_data);
 									}
 									else {
 										let status = "ERROR";
@@ -502,48 +424,30 @@ pub async fn handle_connection(mut socket: TcpStream, state: SharedState) -> Res
 							let coins = (hashrate / 1000.0).round() as u64;
 							let coins = coins.max(10);
 							let (ah, _, _) = get_latest_block_info();
-							let difficulty = calculate_rx_diff(coins, ah);
+							let difficulty = calculate_rx_diff(ah + 1);
 							let target = difficulty_to_target(difficulty);
 
 							if let Some(mut job_state) = state.get_mut(worker_id) {
 								if coins > 0 { //job_state.coins != coins {
 									job_state.coins = coins;
-									let extra_data: String;
-									if ah > EXTRA_NONCE_HEIGHT {
-										extra_data = job_state.worker_id.replace("-", "")[..4].to_lowercase();
-									} else {
-										extra_data = "0101".to_string();
-									}
+									let extra_data = job_state.worker_id.replace("-", "")[..4].to_lowercase();
 									
 									job_state.difficulty = difficulty;
 									job_state.target = target.clone();
 
 									let (actual_height, actual_hash, actual_ts) = get_latest_block_info();
 									let ts_hex = format!("{:010x}", actual_ts);
-									let nonce = MINING_TX_NONCE + actual_height + 1;
-
-									let fee: u64 = config::mining_fee().try_into().unwrap();
-									let fee_base_wei = BigUint::parse_bytes(b"10000000000000000", 10).unwrap();
-									let fee_coins_biguint = BigUint::from(coins);
-									let fee_wei_amount = fee_coins_biguint * &fee_base_wei * fee;
-									let fee_reward_amount = EthersU256::from_dec_str(&fee_wei_amount.to_str_radix(10)).unwrap();
-
-									let signer = format!("0x{}", ethers::utils::hex::encode(config::address()));
-									let base_wei = BigUint::parse_bytes(b"1000000000000000000", 10).unwrap();
-									let wei_amount = (BigUint::from(coins) * &base_wei) - &fee_wei_amount;
-									let reward_amount = EthersU256::from_dec_str(&wei_amount.to_str_radix(10)).unwrap();
-
-									let raw_tx = generate_reward_tx(config::pkey(), nonce, &job_state.miner, reward_amount).unwrap_or_default();
-									let fee_raw_tx = generate_reward_tx(config::pkey(), nonce, &signer, fee_reward_amount).unwrap_or_default();
+									let nonce = "0000";
+									let reward_amount = calculate_reward(actual_height + 1);
+									let raw_tx = generate_reward_tx(nonce, &job_state.miner, reward_amount).unwrap_or_default();
 
 									let blob = format!(
-										"{}{}{}0000000001{}{}0000000000000000{}",
+										"{}{}{}0000000001{}{}",
 										extra_data,
 										ts_hex,
 										actual_hash,
 										target,
-										raw_tx,
-										fee_raw_tx
+										raw_tx
 									);
 									
 									job_state.blob = blob.to_string();
@@ -600,139 +504,85 @@ pub async fn handle_connection(mut socket: TcpStream, state: SharedState) -> Res
     Ok(())
 }
 
-fn mine_block(coins: &str, miner: &str, nonce: &str, id: &str, algo: u64, extra_data: &str) -> sled::Result<()> {	
+fn mine_block(coins: &str, miner: &str, nonce: &str, id: &str, extra_data: &str) -> sled::Result<()> {	
 	let result = (|| {
-		let mining_template = get_mining_template(&coins, &miner);
+		let mining_template = get_mining_template(&miner);
 		let mut modified_password = nonce.to_string();
 		if mining_template.len() > 16 {
 			modified_password.push_str(&mining_template[16..]);
 		}
-
 		let parts: Vec<&str> = mining_template.split('-').collect();
 		let (actual_height, actual_hash, actual_ts) = get_latest_block_info();
-
-		let mined_coins: u64 = parts[1].parse().unwrap();
-		let mined_coins_difficulty;
-		let block_difficulty;
-		if algo == 1 {
-			mined_coins_difficulty = u64::from_str_radix(parts[2], 16).unwrap_or(u64::MAX);
-			block_difficulty = mined_coins_difficulty.clone();
-		}
-		else {
-			mined_coins_difficulty = calculate_rx_diff(mined_coins, actual_height);
-			block_difficulty = calculate_rx_diff(mined_coins, actual_height);
-		}
-		
-		//let mining_hash = pokiohash_hash(&modified_password, nonce);
-		//let mining_difficulty = hash_to_difficulty(&mining_hash) as U256;
-		
-		let mining_transaction = parts[6];
-		let fee_transaction = parts[7];
-		let block_transactions = format!("{}-{}", mining_transaction, fee_transaction);
+		let block_difficulty = calculate_rx_diff(actual_height + 1);
+		let mining_transaction = parts[5];
+		let block_transactions = format!("{}", mining_transaction);
 
 		let db = config::db();
-		//if mining_difficulty > block_difficulty.into() {
-			
-			let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-			let ts_diff = config::ts_diff();
-			let ts_result = now_secs + ts_diff;
-			let pre_timestamp = ts_result as u64;
-			let valid_timestamp;
-			if pre_timestamp < actual_ts {
-				valid_timestamp = actual_ts;
-			} else {
-				valid_timestamp = pre_timestamp;
-			}
-
-			let mut new_block = Block {
-				height: actual_height + 1,
-				hash: "".to_string(),
-				prev_hash: actual_hash,
-				timestamp: valid_timestamp,
-				nonce: nonce.to_string(),
-				//transactions: vec!["tx1".to_string(), "tx2".to_string()],
-				transactions: block_transactions.to_string(),
-				gas_limit: 1000000,
-				gas_used: 750000,
-				miner: miner.to_string(),
-				difficulty: mined_coins_difficulty,
-				block_reward: mined_coins,
-				state_root: "".to_string(),
-				receipts_root: "".to_string(),
-				logs_bloom: "".to_string(),
-				extra_data: extra_data.to_string(),
-				version: 1,
-				signature: "".to_string(),
-			};
-			
-			let mempooldb = config::mempooldb();
-			let mut transactions_list = block_transactions.clone();
-			let mut transactions_hash_list = "".to_string();
-			for entry in mempooldb.iter() {
-				match entry {
-					Ok((key, value)) => {
-						let tx_value_str = String::from_utf8(value.to_vec()).unwrap_or_else(|_| String::from("Invalid UTF-8"));
-						let tx_str = tx_value_str.clone();
-						if db.contains_key(tx_str.clone())? {
-        		            continue;
-                        }
-
-						let dtx = decode_transaction(&tx_str);
-						match dtx {
-							Ok(tx) => {
-								//let address = tx.to.map(|addr| format!("{:?}", addr)).unwrap_or("None".to_string());
-								let sender_address = format!("0x{}", hex::encode(tx.from));
-								//let amount = tx.value.clone().to_string();
-								//let txhash = keccak256(&tx_str); //format!("0x{}", ethers::utils::hex::encode(tx.hash.to_string()));
-								let last_nonce = get_last_nonce(&sender_address, 0);
-								if tx.nonce == EthersU256::from(last_nonce + 1) {
-									/*if transactions_hash_list.clone() == "" {
-										transactions_hash_list = format!("{}", txhash.clone());
-									} else {
-										transactions_hash_list = format!("{}-{}", transactions_hash_list, txhash.clone());
-									}*/
-									transactions_list = format!("{}-{}", transactions_list, tx_value_str);
-									/*if let Err(e) = mempooldb.remove(&key) {
-										eprintln!("Error deleting mempool entry: {:?}", e);
-									}*/
-								} else {
-									if let Err(e) = mempooldb.remove(&key) {
-										eprintln!("Error deleting mempool entry: {:?}", e);
-									}
-								}
-							}
-							Err(e) => {
-								eprintln!("Error processing tx: {:?}", e);
-							}
-						}
-					}
-					Err(e) => {
-						eprintln!("Error reading mempool entry: {:?}", e);
+		let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+		let ts_diff = config::ts_diff();
+		let ts_result = now_secs + ts_diff;
+		let pre_timestamp = ts_result as u64;
+		let valid_timestamp;
+		if pre_timestamp < actual_ts {
+			valid_timestamp = actual_ts;
+		} else {
+			valid_timestamp = pre_timestamp;
+		}
+		let mut new_block = Block {
+			height: actual_height + 1,
+			hash: "".to_string(),
+			prev_hash: actual_hash,
+			timestamp: valid_timestamp,
+			nonce: nonce.to_string(),
+			//transactions: vec!["tx1".to_string(), "tx2".to_string()],
+			transactions: block_transactions.to_string(),
+			gas_limit: 1000000,
+			gas_used: 750000,
+			miner: miner.to_string(),
+			difficulty: block_difficulty,
+			block_reward: 100000000,
+			state_root: "".to_string(),
+			receipts_root: "".to_string(),
+			logs_bloom: "".to_string(),
+			extra_data: extra_data.to_string(),
+			version: 1,
+			signature: "".to_string(),
+		};
+		let mempooldb = config::mempooldb();
+		let mut transactions_list = block_transactions.clone();
+		let mut transactions_hash_list = "".to_string();
+		for entry in mempooldb.iter() {
+			match entry {
+				Ok((key, value)) => {
+					let tx_value_str = String::from_utf8(value.to_vec()).unwrap_or_else(|_| String::from("Invalid UTF-8"));
+					let tx_str = tx_value_str.clone();
+					if db.contains_key(tx_str.clone())? {
+       		            continue;
+                    }
+					transactions_list = format!("{}-{}", transactions_list, tx_value_str);
+					if let Err(e) = mempooldb.remove(&key) {
+						eprintln!("Error deleting mempool entry: {:?}", e);
 					}
 				}
+				Err(e) => {
+					eprintln!("Error reading mempool entry: {:?}", e);
+				}
 			}
-			
-			new_block.transactions = transactions_list;
-			//get merkle tx's receipt
-			new_block.receipts_root = merkle_tree(&new_block.transactions);
-			//get blockhash
-			let unhashed_serialized_block = serde_json::to_string_pretty(&new_block).unwrap();
-			let block_hash = keccak256(&unhashed_serialized_block);
-			
-			let txblock_key = format!("txblock:{}", block_hash.clone());
-			db.insert(txblock_key, transactions_hash_list.as_bytes())?;
-			
-			print_log_message(format!("Block {} found for {} POKIO by miner: {} ({})", new_block.height, new_block.block_reward, new_block.miner, id), 1);
-			
-			new_block.hash = block_hash;
-			
-			if let Err(e) = save_block_to_db(&mut new_block, 1) {
-				eprintln!("Error saving block: {}", e);
-			} else {
-				add_block_to_history(new_block.height, new_block.timestamp, new_block.difficulty, 1);
-				let _ = save_mined_block(&mut new_block, id);
-			}
-		//}
+		}
+		new_block.transactions = transactions_list;
+		//get merkle tx's receipt
+		new_block.receipts_root = merkle_tree(&new_block.transactions);
+		//get blockhash
+		let unhashed_serialized_block = serde_json::to_string_pretty(&new_block).unwrap();
+		let block_hash = keccak256(&unhashed_serialized_block);
+		print_log_message(format!("Block {} found for {} {} by miner: {} ({})", new_block.height, new_block.block_reward as f64 / 100000000.0, COIN_SYMBOL, new_block.miner, id), 1);
+		new_block.hash = block_hash;
+		if let Err(e) = save_block_to_db(&mut new_block, 1) {
+			eprintln!("Error saving block: {}", e);
+		} else {
+			add_block_to_history(new_block.height, new_block.timestamp, new_block.difficulty, 1);
+			let _ = save_mined_block(&mut new_block, id);
+		}
 		Ok(())
 	})();
 	result
@@ -746,35 +596,19 @@ async fn main() -> sled::Result<()> {
 	
 	if help_mode == 1 {
 		println!("Options:");
-		println!("  --async          Run all operations asynchronously to improve performance.");
-		println!("  --fee value      Set a custom transaction fee (in %) for mined blocks.");
 		println!("  --http           Use HTTP protocol instead of NNG for peer communications.");
 		println!("  --nonng          Disable the NNG server startup (no NNG socket connections).");
 		println!("  --server addr    Connect to a specific server IP or domain for synchronization.");
 		println!("  --help           Display this help menu.");
 		println!();
 		println!("Example:");
-		println!("  pokio --async --http --nonng --fee 4 --server node1.pokio.xyz");
+		println!("  ominirex --async --http --nonng --fee 4 --server node1.ominirex.xyz");
 		process::exit(0);
 	}
 	
-	let async_mode = args.iter().any(|arg| arg == "--async") as u8;
 	let http_mode = args.iter().any(|arg| arg == "--http") as u8;
-	let nng_mode = args.iter().any(|arg| arg == "--nonng") as u8;
-	let pre_miningfee = args.iter().position(|arg| arg == "--fee")
-		.and_then(|i| args.get(i + 1))
-		.and_then(|t| t.parse::<usize>().ok())
-		.unwrap_or(DEFAULT_MINING_FEE);
-	
-	let miningfee;
-	
-	if pre_miningfee > 50 {
-		miningfee = 50;
-	} else {
-		miningfee = pre_miningfee;
-	}
-	
-	let mut server_address = "pokio.xyz".to_string();
+	let nng_mode = args.iter().any(|arg| arg == "--nonng") as u8;	
+	let mut server_address = "ominirex.xyz".to_string();
 	if let Some(pos) = args.iter().position(|arg| arg == "--server") {
 		if let Some(addr) = args.get(pos + 1) {
 			server_address = addr.clone();
@@ -784,13 +618,7 @@ async fn main() -> sled::Result<()> {
 		}
 	}
 	
-	config::load_key();
-	config::update_mining_fee(miningfee);
-	config::update_async(async_mode);
-	print_log_message(format!("Private key: {}", config::pkey()), 1);
-	print_log_message(format!("Address (hex): 0x{}", ethers::utils::hex::encode(config::address())), 1);
-	print_log_message(format!("Mining fee set at: {}%", config::mining_fee()), 1);
-	print_log_message(format!("Async Mode: {}", config::async_status()), 1);
+	config::load();
 	
 	let response = reqwest::get("https://pokio.xyz/ts.php").await;
     if let Ok(resp) = response {
@@ -867,7 +695,7 @@ async fn main() -> sled::Result<()> {
 
 			match parts[0] {
 				"version" => {
-					println!("Pokio server 0.2.2");
+					println!("Ominira server 1.0");
 				}
 				"help" => {
 					println!("Available commands:");
@@ -916,9 +744,9 @@ async fn main() -> sled::Result<()> {
 	});
 	
 	let servers = vec![
-		"node1.pokio.xyz".to_string(),
-		"node2.pokio.xyz".to_string(),
-		"pokio.xyz".to_string()
+		"node1.ominirex.xyz".to_string(),
+		"node2.ominirex.xyz".to_string()
+		"omi.pokio.xyz".to_string()
 	];
 	
 	//-- sync at start
@@ -940,7 +768,7 @@ async fn main() -> sled::Result<()> {
         start_server().await.unwrap();
     });
 	
-	//tokio::spawn(async { let _ = connect_to_http_server("node1.pokio.xyz".to_string()); });
+	//tokio::spawn(async { let _ = connect_to_http_server("node1.ominirex.xyz".to_string()); });
 
 
 	if http_mode == 0 {
@@ -970,10 +798,6 @@ async fn main() -> sled::Result<()> {
 			});
 		}
 	}
-	
-	let _ = tokio::spawn(async {
-		let _ = start_virtual_machine();
-	});
 
 	let rpc_route = warp::path("rpc")
 		.and(warp::post())
@@ -1002,6 +826,15 @@ async fn main() -> sled::Result<()> {
 					let blocks = get_next_blocks(block_number);
 					json!({"jsonrpc": "2.0", "id": id, "result": blocks})
 				},
+				"pokio_getBlockByHeight" => {
+					let block_number = data["params"]
+						.get(0)
+						.and_then(|v| v.as_str())
+						.and_then(|s| s.parse::<u64>().ok())
+						.unwrap_or(1);
+					let block_json = get_block_as_json(block_number);
+					json!({ "jsonrpc": "2.0", "id": id, "result": block_json })
+				},
 				"pokio_getMempool" => {
 					match get_mempool_records() {
 						Ok(mempool) => {
@@ -1019,171 +852,63 @@ async fn main() -> sled::Result<()> {
 						}
 					}
 				},
-				//get_mempool_records
-				"eth_chainId" => json!({"jsonrpc": "2.0", "id": id, "result": format!("0x{:x}", CHAIN_ID)}),
-				"eth_getCode" => json!({"jsonrpc": "2.0", "id": id, "result": "0x0000000000000000000000000000000000000000000000000000000000000000"}),
-				"eth_getStorageAt" => json!({"jsonrpc": "2.0", "id": id, "result": "0x1"}),
-				"eth_estimateGas" => {
-					let to = data["params"]
-						.get(0)
-						.and_then(|v| v.get("to"))
-						.and_then(|v| v.as_str())
-						.unwrap_or("")
-						.to_lowercase();
-						
-					match vm_process_eth_call(&to, "type") {
-						Ok(result) => { 
-							json!({"jsonrpc": "2.0", "id": id, "result": "0x4ffff"})
-						},
-						Err(e) => {
-							json!({"jsonrpc": "2.0", "id": id, "result": "0x5208"})
-						}
-					}
-				},
-				"eth_gasPrice" => json!({"jsonrpc": "2.0", "id": id, "result": "0x27eda12b"}),
-				"eth_call" => {
-					if let Some(params) = data["params"].as_array() {
-						if let Some(call_obj) = params.get(0) {
-							let to = call_obj.get("to").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-							let data_field = call_obj.get("data").and_then(|v| v.as_str()).unwrap_or_default();
-							match vm_process_eth_call(&to, data_field) {
-								Ok(result) => { 
-									//println!("{:?}", result);
-									//println!("{:?}", json!({"jsonrpc": "2.0", "id": id, "result": result}));
-									json!({"jsonrpc": "2.0", "id": id, "result": result})
-								},
-								Err(e) => {
-									json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": format!("VM processing error: {}", e) } })
-								}
-							}
-						} else {
-							json!({"jsonrpc": "2.0", "id": id, "error": { "code": -32602, "message": "Invalid params: expected call object" } })
-						}
-					} else {
-						json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32602, "message": "Invalid params: expected array" } })
-					}
-				},
-				"eth_getTransactionCount" => {
-					let address = data["params"]
-						.get(0)
-						.and_then(|v| v.as_str())
-						.unwrap_or("");
-					let last_nonce = get_last_nonce(&address, 0) + 1;
-					print_log_message(format!("Last nonce for {}: {}", address, last_nonce), 2);
-					let hex_nonce = format!("0x{:x}", last_nonce);
-					json!({"jsonrpc": "2.0", "id": id, "result": hex_nonce })
-				}
-				"eth_blockNumber" => {
-					let (actual_height, _actual_hash, _) = get_latest_block_info();
-					let block_number = format!("0x{:x}", actual_height);
-					json!({"jsonrpc": "2.0", "id": id, "result": block_number})
-				},
-				"eth_sendRawTransaction" => {
-					let mut txhash = String::from("0x");
+				"pokio_sendRawTransaction" => {
+					let mut txhash = String::from("");
 					if let Some(params) = data["params"].as_array() {
 						if let Some(raw_tx) = params.get(0) {
 							if let Some(raw_tx_str) = raw_tx.as_str() {
 								print_log_message(format!("Get rawtx: {}", raw_tx_str), 2);
-								txhash = store_raw_transaction(raw_tx_str.to_string());
-								print_log_message(format!("TX hash{}", txhash), 2);
+								if let Ok(tx_bytes) = hex::decode(&raw_tx_str) {
+									if let Ok(raw_tx) = bincode::deserialize::<RawTransaction>(&tx_bytes) {
+										
+										let rtx = RawTransaction {
+											inputcount: raw_tx.inputcount,
+											inputs: raw_tx.inputs,
+											outputcount: raw_tx.outputcount,
+											outputs: raw_tx.outputs.clone(),
+											fee: raw_tx.fee,
+											sigpub: raw_tx.sigpub.clone(),
+											signature: "".to_string(),
+										};
+										
+										let tx_binary = bincode::serialize(&rtx)
+											.expect("Failed to serialize transaction");
+										let tx_hash = blake3::hash(&tx_binary);
+										
+										let bytes_decoded_signature = decode(&raw_tx.signature).expect("Error decoding signature");
+										let decoded_signature = <pqcrypto_sphincsplus::sphincssha2128fsimple::DetachedSignature as DetachedSignatureTrait>::from_bytes(&bytes_decoded_signature)
+											.expect("Error in signature reconstruction");
+										
+										let pk_bytes = decode(&raw_tx.sigpub).expect("Invalid pubkey");
+										let pk = PublicKey::from_bytes(&pk_bytes).expect("Invalid pubkey format");
+
+										match verify_detached_signature(&decoded_signature, tx_hash.as_bytes(), &pk) {
+											Ok(_) => print_log_message(format!("TX received with valid key pair"), 2),
+											Err(e) => {
+												print_log_message(format!("TX received with error: Private and public keys don't form a valid pair"), 2);
+												print_log_message(format!("Details: {}", e), 3);
+											}
+										}
+										
+										for (vout, (output_address, amount)) in raw_tx.outputs.iter().enumerate() {
+											let b3_tx_hash = blake3::hash(&raw_tx_str.as_bytes());
+											let txhash = hex::encode(b3_tx_hash.as_bytes());
+											let key = format!("{}:{}", txhash, vout);
+											let value = serde_json::json!({
+												"address": output_address,
+												"amount": amount
+											});
+											let value_str = value.to_string();
+										}
+										store_raw_transaction(raw_tx_str.to_string());
+									}
+								}								
 							}
 						}
+						
+						
 					}
-					json!({"jsonrpc": "2.0", "id": id, "result": format!("0x{}", txhash)})
-				},
-				"eth_getBlockByNumber" => {
-					let block_number = data["params"]
-						.get(0)
-						.and_then(|v| v.as_str())
-						.and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-						.unwrap_or(1);
-
-					let mut block_json = get_block_as_json(block_number);
-
-					if let Value::Object(ref mut obj) = block_json {
-						let field_mappings = [
-							("height", "number"),
-							("state_root", "stateRoot"),
-							("prev_hash", "parentHash"),
-						];
-						for (old_key, new_key) in &field_mappings {
-							if let Some(value) = obj.remove(*old_key) {
-								obj.insert(new_key.to_string(), value);
-							}
-						}
-
-						let hex_fields = [
-							"timestamp",
-							"difficulty",
-							"gas_limit",
-							"gas_used",
-							"number",
-						];
-						for field in &hex_fields {
-							if let Some(value) = obj.remove(*field) {
-								if let Some(num) = value.as_u64() {
-									obj.insert(field.to_string(), Value::String(format!("0x{:x}", num)));
-								}
-							}
-						}
-					}
-
-					json!({ "jsonrpc": "2.0", "id": id, "result": block_json })
-				},
-				"net_version" => json!({"jsonrpc": "2.0", "id": id, "result": CHAIN_ID.to_string()}),
-				"eth_getBalance" => {
-					let address = data["params"]
-						.get(0)
-						.and_then(|v| v.as_str())
-						.unwrap_or("");
-					let address_balance = get_balance(address);
-					let balance = match address_balance {
-						Ok(b) => b,
-						Err(_) => "0".to_string(),
-					};
-					let balance_biguint = BigUint::from_str(&balance).unwrap_or_else(|_| BigUint::zero());
-					let hex_balance = format!("0x{}", balance_biguint.to_str_radix(16));
-					json!({"jsonrpc": "2.0", "id": id, "result": hex_balance})
-				},
-				"eth_getTransactionReceipt" => {
-					let txhash = data["params"]
-						.get(0)
-						.and_then(|v| v.as_str())
-						.unwrap_or("");
-					print_log_message(format!("Ask receipt: {}", txhash), 2);
-					if let Some((_receipt, block)) = get_receipt_info(txhash) {
-						let block_json = get_block_as_json(block);
-						print_log_message(format!("Block sent: {}", block_json), 3);
-						let hexblock = format!("0x{:x}", block);						
-						json!({"jsonrpc": "2.0", "id": id, "result": { "blockHash" : block_json.get("hash"), "blockNumber" : hexblock,
-							"contractAddress" : null, "cumulativeGasUsed" : "0x0", "effectiveGasPrice" : "0x0", "from" : "", "gasUsed" : "0x0",
-							" logs" : [ { "removed" : false } ], "logsBloom" :"0x0", "status" : "0x1", "to" : "", "transactionHash" : txhash, "transactionIndex" : "0x0", 
-							"type" : "0x2" } })
-					} else {
-						json!({"jsonrpc": "2.0", "id": id, "result": ""})
-					}
-				},
-				"eth_getRawTransactionStatus" => {
-					let txhash = data["params"]
-						.get(0)
-						.and_then(|v| v.as_str())
-						.unwrap_or("");
-					if let Some(status) = get_rawtx_status(txhash) {						
-						json!({"jsonrpc": "2.0", "id": id, "result": status })
-					} else {
-						json!({"jsonrpc": "2.0", "id": id, "result": "pending"})
-					}
-				},
-				"eth_getBlockByHash" => {
-					let blockhash = data["params"]
-						.get(0)
-						.and_then(|v| v.as_str())
-						.unwrap_or("");
-					if let Some(_txs) = get_block_tx_hashes(blockhash) {
-						json!({"jsonrpc": "2.0", "id": id, "result": ""})
-					} else {
-						json!({"jsonrpc": "2.0", "id": id, "result": ""})
-					}
+					json!({"jsonrpc": "2.0", "id": id, "result": format!("{}", txhash)})
 				},
 				_ => {
 					print_log_message(format!("Received JSON: {}", data), 3);
@@ -1236,7 +961,7 @@ async fn main() -> sled::Result<()> {
 							template
 						}
 						None => {
-							let new_template = get_mining_template(&coins, miner);
+							let new_template = get_mining_template(miner);
 							cache.lock().unwrap().insert(key, new_template.clone());
 							save_miner(&miner.to_lowercase(), id, &coins, hr);
 							new_template
@@ -1319,7 +1044,7 @@ async fn main() -> sled::Result<()> {
 					let nonce = data["nonce"].as_str().unwrap_or("0000000000000000");
 					let ip_str = addr.map(|a| a.ip().to_string());
 
-					match mine_block(coins, miner, nonce, id, 1, "") {
+					match mine_block(coins, miner, nonce, id, "") {
 						Ok(_) => {
 							json!({"jsonrpc": "2.0", "id": id, "result": "ok"})
 						}
@@ -1333,8 +1058,7 @@ async fn main() -> sled::Result<()> {
 					let miner = data["params"]["miner"].as_str().unwrap_or("");
 					let nonce = data["params"]["nonce"].as_str().unwrap_or("00000000");
 					let extra_data = data["params"]["extra_data"].as_str().unwrap_or("");
-
-					match mine_block(coins, miner, nonce, id, 2, extra_data) {
+					match mine_block(coins, miner, nonce, id, extra_data) {
 						Ok(_) => {
 							json!({"jsonrpc": "2.0", "id": id, "result": "ok"})
 						}
@@ -1344,7 +1068,6 @@ async fn main() -> sled::Result<()> {
 					}
 				},
 				"putBlock" => {
-					
 					match serde_json::from_value::<String>(data["block"].clone()) {
 						Ok(block_str) => {
 							match serde_json::from_str::<serde_json::Value>(&block_str) {
@@ -1394,7 +1117,7 @@ async fn main() -> sled::Result<()> {
 		}).with(warp::compression::gzip());
 
 	let routes = rpc_route.or(mining_route);
-	warp::serve(routes).run(([0, 0, 0, 0], 30303)).await;
+	warp::serve(routes).run(([0, 0, 0, 0], 40404)).await;
 	Ok(())
 }
 
@@ -1403,7 +1126,7 @@ async fn full_sync_blocks(pserver: String) -> Result<(), Box<dyn std::error::Err
 		.timeout(Duration::from_secs(5))
 		.build()
 		.expect("Failed to build HTTP client");
-	let rpc_url = format!("http://{}:30303/rpc", pserver);
+	let rpc_url = format!("http://{}:40404/rpc", pserver);
 	let db = config::db();
 	loop {
 		let max_block_response = client.post(&rpc_url)
