@@ -1,16 +1,16 @@
-# pokio-server
+# ominira-server
 
 # Build on Ubuntu
 
-This guide walks you through how to install Rust and compile a Pokio Server on Ubuntu.
+This guide walks you through how to install Rust and compile a Ominira Server on Ubuntu.
 
 ---
 
 ## 1. Clone this repository
 
 ```
-git clone https://github.com/pokiochain/pokio-server.git
-cd pokio-server
+git clone https://github.com/ominirex/ominira-server.git
+cd ominira-server
 ```
 
 ---
@@ -27,7 +27,7 @@ chmod 755 compile.sh
 The binary will be located in:
 
 ```
-./target/release/pokio
+./target/release/ominirad
 ```
 
 ---
