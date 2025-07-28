@@ -834,6 +834,11 @@ async fn main() -> sled::Result<()> {
 					let block_json = get_block_as_json(block_number);
 					json!({ "jsonrpc": "2.0", "id": id, "result": block_json })
 				},
+				"pokio_blockNumber" => {
+					let (actual_height, _actual_hash, _) = get_latest_block_info();
+					let block_number = format!("0x{:x}", actual_height);
+					json!({"jsonrpc": "2.0", "id": id, "result": block_number})
+				},
 				"pokio_getMempool" => {
 					match get_mempool_records() {
 						Ok(mempool) => {
@@ -1127,7 +1132,7 @@ async fn full_sync_blocks(pserver: String) -> Result<(), Box<dyn std::error::Err
 	let db = config::db();
 	loop {
 		let max_block_response = client.post(&rpc_url)
-			.json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "eth_blockNumber", "params": [] }))
+			.json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "pokio_blockNumber", "params": [] }))
 			.send()
 			.await?;
 		let max_block_json: serde_json::Value = max_block_response.json().await?;
