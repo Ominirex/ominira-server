@@ -203,7 +203,6 @@ pub fn connect_to_nng_server(pserver: String) -> Result<(), Box<dyn std::error::
 									.send()
 									.await
 								{
-									println!("{:?}", response.headers()); //debug - remove
 									if let Ok(json_response) = response.json::<serde_json::Value>().await {
 										if let Some(mempool_array) = json_response["result"].as_array() {
 											for raw_tx in mempool_array {
