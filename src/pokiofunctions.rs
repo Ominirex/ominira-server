@@ -36,6 +36,7 @@ use monero::{blockdata::block::Block as MoneroBlock, consensus::encode::deserial
 use hex::FromHex;
 use blake3;
 use hex::encode;
+use std::collections::HashSet;
 
 use crate::constants::*;
 use crate::merkle::*;
@@ -731,18 +732,15 @@ pub fn save_block_to_db(new_block: &mut Block, checkpoint: u8) -> Result<(), Box
 				let serialized_block = bincode::serialize(&new_block).unwrap();
 				let unsigned_serialized_block = serde_json::to_string_pretty(&new_block).unwrap();*/
 			}
-			let serialized_block = bincode::serialize(new_block)?;
-			let _ = db.insert(format!("block:{:08}", new_block.height), serialized_block)?;
-			let _ = db.insert(format!("hash:{}", new_block.hash), &new_block.height.to_be_bytes())?;
-			let _ = db.insert("chain:latest_block", &new_block.height.to_be_bytes())?;
-			config::update_actual_height(new_block.height.clone());
-			config::update_actual_hash(new_block.hash.clone());
-			config::update_actual_timestamp(new_block.timestamp.clone());
-			let block_transactions: Vec<&str> = new_block.transactions.split('-').collect();
+						let block_transactions: Vec<&str> = new_block.transactions.split('-').collect();
 			let mut txcount: u8 = 0;
 			let mut sender_address: String = "".to_string();
+			let mut pending_inputs: Vec<(String, Vec<u8>)> = Vec::new();
+			let mut pending_outputs: Vec<(String, Vec<u8>)> = Vec::new();
+			let mut spent_utxos_in_block: HashSet<String> = HashSet::new();
+
 			for tx_str in block_transactions {
-				if let Err(e) = mempooldb.remove(&tx_str) {	eprintln!("Error deleting mempool entry: {:?}", e); }
+				if let Err(e) = mempooldb.remove(&tx_str) { eprintln!("Error deleting mempool entry: {:?}", e); }
 				if tx_str == "" { continue; }
 				if db.contains_key(tx_str)? { continue; }
 				if let Ok(tx_bytes) = hex::decode(&tx_str) {
@@ -781,6 +779,11 @@ pub fn save_block_to_db(new_block: &mut Block, checkpoint: u8) -> Result<(), Box
 							let mut total_inputs_amount = 0u64;
 							for input in &raw_tx.inputs {
 								let key = format!("{}:{}", input.txid, input.vout);
+								
+								if spent_utxos_in_block.contains(&key) {
+									return Err(format!("Double spending detected in block for UTXO: {}", key).into());
+								}
+								
 								if let Some(utxo_bytes) = utxodb.get(&key)? {
 									let utxo_value: serde_json::Value = serde_json::from_slice(&utxo_bytes)
 										.map_err(|e| format!("Failed to parse UTXO JSON: {}", e))?;
@@ -797,7 +800,8 @@ pub fn save_block_to_db(new_block: &mut Block, checkpoint: u8) -> Result<(), Box
 										"address": utxo_value["address"].as_str().ok_or("Invalid address in UTXO")?,
 										"amount": 0
 									});
-									utxodb.insert(key, spent_value.to_string().as_bytes())?;
+									pending_inputs.push((key.clone(), spent_value.to_string().into_bytes()));
+									spent_utxos_in_block.insert(key);
 								} else {
 									return Err("Referenced UTXO not found".into());
 								}
@@ -833,12 +837,28 @@ pub fn save_block_to_db(new_block: &mut Block, checkpoint: u8) -> Result<(), Box
 								"amount": amount
 							});
 							let value_str = value.to_string();
-							utxodb.insert(key, value_str.as_bytes())?;
+							pending_outputs.push((key, value_str.into_bytes()));
 						}
 					}
 				}
 				txcount = txcount + 1;
 			}
+
+
+			for (key, value) in pending_inputs {
+				utxodb.insert(key, value)?;
+			}
+
+			for (key, value) in pending_outputs {
+				utxodb.insert(key, value)?;
+			}
+			let serialized_block = bincode::serialize(new_block)?;
+			let _ = db.insert(format!("block:{:08}", new_block.height), serialized_block)?;
+			let _ = db.insert(format!("hash:{}", new_block.hash), &new_block.height.to_be_bytes())?;
+			let _ = db.insert("chain:latest_block", &new_block.height.to_be_bytes())?;
+			config::update_actual_height(new_block.height.clone());
+			config::update_actual_hash(new_block.hash.clone());
+			config::update_actual_timestamp(new_block.timestamp.clone());
 			print_log_message(format!("Block {} successfully saved in DB", new_block.height), 3);
 			let _ = check_integrity();
 		}	

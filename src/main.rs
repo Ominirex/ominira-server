@@ -1148,7 +1148,12 @@ async fn main() -> sled::Result<()> {
 										if total_inputs_amount >= required_amount {
 											store_raw_transaction(raw_tx_str.to_string());
 											let b3_tx_hash = blake3::hash(&raw_tx_str.as_bytes());
-											let txhash = hex::encode(b3_tx_hash.as_bytes());
+											txhash = hex::encode(b3_tx_hash.as_bytes());
+											print_log_message(format!("TX stored in mempool: {}", txhash), 3);
+										} else {
+											let b3_tx_hash = blake3::hash(&raw_tx_str.as_bytes());
+											let etxhash = hex::encode(b3_tx_hash.as_bytes());
+											print_log_message(format!("TX rejected: {}", etxhash), 3);
 										}
 										
 									}
