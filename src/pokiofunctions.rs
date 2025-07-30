@@ -35,6 +35,7 @@ use std::io::BufRead;
 use monero::{blockdata::block::Block as MoneroBlock, consensus::encode::deserialize, consensus::encode::serialize};
 use hex::FromHex;
 use blake3;
+use hex::encode;
 
 use crate::constants::*;
 use crate::merkle::*;
@@ -137,11 +138,11 @@ pub fn calculate_reward(height: u64) -> u64 {
     if height == 1 {
         10000000000000
     } else if height > 1 && height < 4200000 {
-        250000000
+        1000000000
     } else if height >= 4200000 && height < 8400000 {
-        125000000
+        5000000000
     } else if height >= 8400000 && height < 12600000 {
-        62500000
+        2500000000
     } else {
         10000000
     }
@@ -151,10 +152,10 @@ pub fn calculate_rx_diff(height: u64) -> u64 {
 	if height <= 17 {
 		10000
 	} else {
-		let expectedtime: u64 = 16 * 240;
-		let Some((blocktime, totaldiff)) = get_block_range_analysis(height-1) else { return 2400000 };
+		let expectedtime: u64 = 16 * 120;
+		let Some((blocktime, totaldiff)) = get_block_range_analysis(height-1) else { return 1200000 };
 		let x = (expectedtime * totaldiff) / blocktime / 16;
-		max(24000, x)
+		max(12000, x)
 	}
 }
 
@@ -686,6 +687,7 @@ pub fn save_block_to_db(new_block: &mut Block, checkpoint: u8) -> Result<(), Box
 						}
 					};
 					let mut rx_hashdiff = 0;
+					
 					if let Ok(mut stream) = nTcpStream::connect("127.0.0.1:16789") {
 						let request = json!({
 							"blob": &rx_blob, 
@@ -738,6 +740,7 @@ pub fn save_block_to_db(new_block: &mut Block, checkpoint: u8) -> Result<(), Box
 			config::update_actual_timestamp(new_block.timestamp.clone());
 			let block_transactions: Vec<&str> = new_block.transactions.split('-').collect();
 			let mut txcount: u8 = 0;
+			let mut sender_address: String = "".to_string();
 			for tx_str in block_transactions {
 				if let Err(e) = mempooldb.remove(&tx_str) {	eprintln!("Error deleting mempool entry: {:?}", e); }
 				if tx_str == "" { continue; }
@@ -759,42 +762,37 @@ pub fn save_block_to_db(new_block: &mut Block, checkpoint: u8) -> Result<(), Box
 								.map_err(|e| format!("Failed to serialize transaction: {}", e))?;
 							let tx_hash = blake3::hash(&tx_binary);
 							
-							let bytes_decoded_signature = decode(&raw_tx.signature)
+							let bytes_decoded_signature = hex::decode(&raw_tx.signature)
 								.map_err(|e| format!("Error decoding signature: {}", e))?;
 							let decoded_signature = <pqcrypto_sphincsplus::sphincssha2128fsimple::DetachedSignature as DetachedSignatureTrait>::from_bytes(&bytes_decoded_signature)
 								.map_err(|e| format!("Error in signature reconstruction: {}", e))?;
 							
-							let pk_bytes = decode(&raw_tx.sigpub)
+							let pk_bytes = hex::decode(&raw_tx.sigpub)
 								.map_err(|e| format!("Invalid pubkey: {}", e))?;
 							let pk = PublicKey::from_bytes(&pk_bytes)
 								.map_err(|e| format!("Invalid pubkey format: {}", e))?;
+							
+							let address_hash = blake3::hash(pk.as_bytes());
+							sender_address = hex::encode(address_hash.as_bytes());
 
 							verify_detached_signature(&decoded_signature, tx_hash.as_bytes(), &pk)
 								.map_err(|e| format!("Invalid signature: {}", e))?;
-						}
 
-						for (vout, (output_address, amount)) in raw_tx.outputs.iter().enumerate() {
-							let b3_tx_hash = blake3::hash(&tx_str.as_bytes());
-							let tx_hash = hex::encode(b3_tx_hash.as_bytes());
-							let key = format!("{}:{}", tx_hash, vout);
-							let value = serde_json::json!({
-								"address": output_address,
-								"amount": amount
-							});
-							let value_str = value.to_string();
-							utxodb.insert(key, value_str.as_bytes())?;
-						}
-
-						if txcount > 0 {
 							let mut total_inputs_amount = 0u64;
 							for input in &raw_tx.inputs {
 								let key = format!("{}:{}", input.txid, input.vout);
 								if let Some(utxo_bytes) = utxodb.get(&key)? {
 									let utxo_value: serde_json::Value = serde_json::from_slice(&utxo_bytes)
 										.map_err(|e| format!("Failed to parse UTXO JSON: {}", e))?;
-									let amount = utxo_value["amount"].as_u64()
-										.ok_or("Invalid amount in UTXO")?;
+									let amount = utxo_value["amount"].as_u64().ok_or("Invalid amount in UTXO")?;
+									let owner = utxo_value["address"].as_str().ok_or("Invalid address in UTXO")?;
+										
 									total_inputs_amount += amount;
+									
+									if sender_address != owner {
+										return Err("TX with invalid UTXO".into());
+									}
+									
 									let spent_value = serde_json::json!({
 										"address": utxo_value["address"].as_str().ok_or("Invalid address in UTXO")?,
 										"amount": 0
@@ -814,6 +812,28 @@ pub fn save_block_to_db(new_block: &mut Block, checkpoint: u8) -> Result<(), Box
 									total_inputs_amount, required_amount
 								).into());
 							}
+						} else {
+							let total_outputs_amount: u64 = raw_tx.outputs.iter().map(|(_, amount)| amount).sum();
+							let required_amount = total_outputs_amount + raw_tx.fee;
+							
+							if new_block.block_reward < required_amount {
+								return Err(format!(
+									"Insufficient funds: inputs {} < outputs + fee {}",
+									new_block.block_reward, required_amount
+								).into());
+							}
+						}
+						
+						for (vout, (output_address, amount)) in raw_tx.outputs.iter().enumerate() {
+							let b3_tx_hash = blake3::hash(&tx_str.as_bytes());
+							let tx_hash = hex::encode(b3_tx_hash.as_bytes());
+							let key = format!("{}:{}", tx_hash, vout);
+							let value = serde_json::json!({
+								"address": output_address,
+								"amount": amount
+							});
+							let value_str = value.to_string();
+							utxodb.insert(key, value_str.as_bytes())?;
 						}
 					}
 				}

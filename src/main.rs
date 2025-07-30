@@ -57,6 +57,7 @@ use nngutils::*;
 
 use randomx_rs::{RandomXCache, RandomXVM, RandomXFlag};
 use hex::decode;
+use hex::encode;
 use std::convert::TryInto;
 use once_cell::sync::Lazy;
 use tokio::net::tcp::OwnedWriteHalf;
@@ -393,7 +394,7 @@ pub async fn handle_connection(mut socket: TcpStream, state: SharedState) -> Res
 										writer.write_all(response_text.as_bytes()).await?;
 										let (actual_height, _actual_hash, _actual_ts) = get_latest_block_info();
 										let extra_data = job_state.worker_id.replace("-", "")[..4].to_lowercase();
-										let _ = mine_block(&job_state.coins.to_string(), &job_state.miner, nonce, worker_id, &extra_data);
+										let _ = mine_block(&job_state.miner, nonce, worker_id, &extra_data, None);
 									}
 									else {
 										let status = "ERROR";
@@ -502,7 +503,7 @@ pub async fn handle_connection(mut socket: TcpStream, state: SharedState) -> Res
     Ok(())
 }
 
-fn mine_block(coins: &str, miner: &str, nonce: &str, id: &str, extra_data: &str) -> sled::Result<()> {	
+fn mine_block(miner: &str, nonce: &str, id: &str, extra_data: &str, rhash: Option<&mut String>) -> sled::Result<()> {	
 	let result = (|| {
 		let mining_template = get_mining_template(&miner);
 		let mut modified_password = nonce.to_string();
@@ -575,7 +576,12 @@ fn mine_block(coins: &str, miner: &str, nonce: &str, id: &str, extra_data: &str)
 		let unhashed_serialized_block = serde_json::to_string_pretty(&new_block).unwrap();
 		let block_hash = keccak256(&unhashed_serialized_block);
 		print_log_message(format!("Block {} found for {} {} by miner: {} ({})", new_block.height, new_block.block_reward as f64 / 100000000.0, COIN_SYMBOL, new_block.miner, id), 1);
+		
 		new_block.hash = block_hash;
+		if let Some(var) = rhash {
+			*var = new_block.hash.to_string();
+		}
+		
 		if let Err(e) = save_block_to_db(&mut new_block, 1) {
 			eprintln!("Error saving block: {}", e);
 		} else {
@@ -618,6 +624,7 @@ async fn main() -> sled::Result<()> {
 	}
 	
 	config::load();
+	let utxodb = config::utxodb();
 	
 	let response = reqwest::get("https://pokio.xyz/ts.php").await;
     if let Ok(resp) = response {
@@ -816,6 +823,225 @@ async fn main() -> sled::Result<()> {
 			let method = data["method"].as_str().unwrap_or("");
 			
 			let response = match method {
+				"get_info" => {
+					let (height, top_block_hash, adjusted_time) = get_latest_block_info();
+					let cumulative_difficulty = calculate_rx_diff(height);
+					let current_difficulty = calculate_rx_diff(height);
+					let start_time = adjusted_time.clone();
+					
+					json!({
+						"id": id,
+						"jsonrpc": "2.0",
+						"result": {
+							"adjusted_time": adjusted_time,
+							"busy_syncing": false,
+							"cumulative_difficulty": cumulative_difficulty,
+							"cumulative_difficulty_top64": 0,
+							"difficulty": current_difficulty,
+							"grey_peerlist_size": 4999,
+							"height": height,
+							"height_without_bootstrap": height,
+							"incoming_connections_count": 4,
+							"mainnet": true,
+							"nettype": "mainnet",
+							"offline": false,
+							"outgoing_connections_count": 3,
+							"rpc_connections_count": 1,
+							"stagenet": false,
+							"start_time": start_time,
+							"status": "OK",
+							"synchronized": true,
+							"target": 120,
+							"target_height": height.saturating_sub(8),
+							"testnet": false,
+							"top_block_hash": top_block_hash,
+							"top_hash": "",
+							"tx_count": 0,
+							"tx_pool_size": 0,
+							"untrusted": false,
+							"version": "1.0",
+							"white_peerlist_size": 1000,
+							"wide_cumulative_difficulty": format!("0x{:x}", cumulative_difficulty),
+							"wide_difficulty": format!("0x{:x}", current_difficulty)
+						}
+					})
+				},
+				"getlastblockheader" => {
+					let (height, hash, ts) = get_latest_block_info();
+					let diff = calculate_rx_diff(height);
+					
+					json!({
+						"id": id,
+						"jsonrpc": "2.0",
+						"result": {
+							"block_header": {
+								"block_size": 5500,
+								"block_weight": 5500,
+								"cumulative_difficulty": diff,
+								"cumulative_difficulty_top64": 0,
+								"depth": 0,
+								"difficulty": diff,
+								"difficulty_top64": 0,
+								"hash": hash,
+								"height": height,
+								"long_term_weight": 5500,
+								"major_version": 1,
+								"miner_tx_hash": "",
+								"minor_version": 1,
+								"nonce": 249602367,
+								"num_txes": 0,
+								"orphan_status": false,
+								"pow_hash": "",
+								"prev_hash": "",
+								"reward": calculate_reward(height),
+								"timestamp": ts,
+								"wide_cumulative_difficulty": format!("0x{:x}", diff),
+								"wide_difficulty": format!("0x{:x}", diff),
+							},
+							"credits": 0,
+							"status": "OK",
+							"top_hash": "",
+							"untrusted": false
+						}
+					})
+				},
+				"getblock" | "getblockheaderbyheight" => {
+					let empty_params = serde_json::Map::new();
+					let params = data["params"].as_object().unwrap_or(&empty_params);
+					let height = params.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
+					let block_json = get_block_as_json(height);
+					
+					let timestamp = block_json["timestamp"].as_u64().unwrap_or(0);
+					let ts_hex = format!("{:010x}", timestamp);
+					let difficulty = calculate_rx_diff(height);
+					let target = difficulty_to_target(difficulty);
+					
+					let blob = format!(
+						"0000{}{}{}01{}",
+						ts_hex,
+						block_json["hash"].as_str().unwrap_or(""),
+						block_json["nonce"].as_str().unwrap_or(""),
+						target
+					);
+					
+					let (ah, _, _) = get_latest_block_info();
+					
+					json!({
+						"id": id,
+						"jsonrpc": "2.0",
+						"result": {
+							"blob": blob,
+							"block_header": {
+								"block_size": 1000,
+								"block_weight": 1000,
+								"cumulative_difficulty": 0,
+								"cumulative_difficulty_top64": 0,
+								"depth": ah - height,
+								"difficulty": block_json["difficulty"].as_u64().unwrap_or(0),
+								"difficulty_top64": 0,
+								"hash": block_json["hash"].as_str().unwrap_or(""),
+								"height": height,
+								"long_term_weight": 176470,
+								"major_version": 1,
+								"miner_tx_hash": "",
+								"minor_version": 1,
+								"nonce": block_json["nonce"].as_str().unwrap_or(""),
+								"num_txes": 0,
+								"orphan_status": false,
+								"pow_hash": "",
+								"prev_hash": block_json["prev_hash"].as_str().unwrap_or(""),
+								"reward": block_json["block_reward"].as_u64().unwrap_or(0),
+								"timestamp": block_json["timestamp"].as_u64().unwrap_or(0),
+								"wide_cumulative_difficulty": format!("0x{:x}", 0),
+								"wide_difficulty": format!("0x{:x}", difficulty)
+							},
+							"credits": 0,
+							"miner_tx_hash": "",
+							"status": "OK",
+							"top_hash": "",
+							"untrusted": false
+						}
+					})
+				},
+				"getblocktemplate" => {
+					let empty_params = serde_json::Map::new();
+					let params = data["params"].as_object().unwrap_or(&empty_params);
+    
+					let wallet_address = params.get("wallet_address")
+						.and_then(|v| v.as_str())
+						.unwrap_or("");
+					
+					let reserve_size = params.get("reserve_size")
+						.and_then(|v| v.as_u64())
+						.unwrap_or(0);
+
+					let (height, hash, ts) = get_latest_block_info();
+					let ts_hex = format!("{:010x}", ts);
+					let nonce = "0000";
+					let difficulty = calculate_rx_diff(height + 1);
+					let target = difficulty_to_target(difficulty);
+
+					let reward_amount = calculate_reward(height + 1);
+					let raw_tx = generate_reward_tx(nonce, wallet_address, reward_amount).unwrap_or_default();
+
+					let blob = format!(
+						"0000{}{}0000000001{}{}",
+						ts_hex,
+						hash,
+						target,
+						raw_tx
+					);
+					
+					json!({
+						"id": id,
+						"jsonrpc": "2.0",
+						"result": {
+							"blockhashing_blob": blob,
+							"blocktemplate_blob": blob,
+							"difficulty": difficulty,
+							"difficulty_top64": 0,
+							"expected_reward": reward_amount,
+							"height": height + 1,
+							"next_seed_hash": "",
+							"prev_hash": hash,
+							"reserved_offset": 130,
+							"seed_hash": "b38737d8f08e1b0b033611bb268bd79b236c3089a756b79906eff085c67a7e31",
+							"seed_height": 0,
+							"status": "OK",
+							"untrusted": false,
+							"wide_difficulty": format!("0x{}", target)
+						}
+					})
+				},
+				"submitblock" => {
+					let nonce = data["params"]
+						.get(0)
+						.and_then(|v| v.as_str())
+						.unwrap_or("000000000000");
+						
+					let extranonce = data["params"]
+						.get(1)
+						.and_then(|v| v.as_str())
+						.unwrap_or("000000000000");
+						
+					let miner = data["params"]
+						.get(2)
+						.and_then(|v| v.as_str())
+						.unwrap_or("000000000000000000000000000000000000000000000000000000000000000000000000dead");
+					
+					let short_nonce = &nonce[..8.min(nonce.len())];
+					
+					let mut rhash = String::from("");
+					
+					match mine_block(miner, short_nonce, id, extranonce, Some(&mut rhash)) {
+						Ok(_) => {
+							json!({"jsonrpc": "2.0", "id": id, "result": {"hash" : rhash} })
+						}
+						Err(_) => {
+							json!({"jsonrpc": "2.0", "id": id, "error": { "code": -7, "message": "Block not accepted" } })
+						}
+					}
+				},
 				"pokio_getBlocks" => {
 					let block_number = data["params"]
 						.get(0)
@@ -867,7 +1093,7 @@ async fn main() -> sled::Result<()> {
 										
 										let rtx = RawTransaction {
 											inputcount: raw_tx.inputcount,
-											inputs: raw_tx.inputs,
+											inputs: raw_tx.inputs.clone(),
 											outputcount: raw_tx.outputcount,
 											outputs: raw_tx.outputs.clone(),
 											fee: raw_tx.fee,
@@ -875,36 +1101,56 @@ async fn main() -> sled::Result<()> {
 											signature: "".to_string(),
 										};
 										
+										let mut total_inputs_amount = 0u64;
+										let total_outputs_amount: u64 = raw_tx.outputs.iter().map(|(_, amount)| amount).sum();
+										let mut required_amount = total_outputs_amount + raw_tx.fee;
+										
 										let tx_binary = bincode::serialize(&rtx)
 											.expect("Failed to serialize transaction");
 										let tx_hash = blake3::hash(&tx_binary);
 										
-										let bytes_decoded_signature = decode(&raw_tx.signature).expect("Error decoding signature");
+										let bytes_decoded_signature = hex::decode(&raw_tx.signature).expect("Error decoding signature");
 										let decoded_signature = <pqcrypto_sphincsplus::sphincssha2128fsimple::DetachedSignature as DetachedSignatureTrait>::from_bytes(&bytes_decoded_signature)
 											.expect("Error in signature reconstruction");
 										
-										let pk_bytes = decode(&raw_tx.sigpub).expect("Invalid pubkey");
+										let pk_bytes = hex::decode(&raw_tx.sigpub).expect("Invalid pubkey");
 										let pk = PublicKey::from_bytes(&pk_bytes).expect("Invalid pubkey format");
+										
+										let address_hash = blake3::hash(pk.as_bytes());
+										let sender_address = hex::encode(address_hash.as_bytes());
 
 										match verify_detached_signature(&decoded_signature, tx_hash.as_bytes(), &pk) {
 											Ok(_) => print_log_message(format!("TX received with valid key pair"), 2),
 											Err(e) => {
 												print_log_message(format!("TX received with error: Private and public keys don't form a valid pair"), 2);
 												print_log_message(format!("Details: {}", e), 3);
+												required_amount = 9999999999999999;
 											}
 										}
 										
-										for (vout, (output_address, amount)) in raw_tx.outputs.iter().enumerate() {
+										for input in &raw_tx.inputs {
+											let key = format!("{}:{}", input.txid, input.vout);
+											if let Ok(Some(utxo_bytes)) = utxodb.get(&key) {
+												let utxo_value: serde_json::Value = serde_json::from_slice(&utxo_bytes).expect("Failed to parse UTXO JSON");
+												let amount = utxo_value["amount"].as_u64().expect("Invalid amount in UTXO");
+												let owner = utxo_value["address"].as_str().expect("Invalid amount in UTXO");
+												if owner != sender_address {
+													required_amount = 9999999999999999;
+													break;
+												}
+												total_inputs_amount += amount;
+											} else {
+												required_amount = 9999999999999999;
+												break;
+											}
+										}
+										
+										if total_inputs_amount >= required_amount {
+											store_raw_transaction(raw_tx_str.to_string());
 											let b3_tx_hash = blake3::hash(&raw_tx_str.as_bytes());
 											let txhash = hex::encode(b3_tx_hash.as_bytes());
-											let key = format!("{}:{}", txhash, vout);
-											let value = serde_json::json!({
-												"address": output_address,
-												"amount": amount
-											});
-											let value_str = value.to_string();
 										}
-										store_raw_transaction(raw_tx_str.to_string());
+										
 									}
 								}								
 							}
@@ -920,7 +1166,7 @@ async fn main() -> sled::Result<()> {
 				}
 			};
 			warp::reply::json(&response)
-		}).with(warp::compression::gzip());
+		});
 	
 	type CacheKey = (u64, String, String);
 	type MiningCache = Arc<Mutex<HashMap<CacheKey, String>>>;
@@ -1043,12 +1289,11 @@ async fn main() -> sled::Result<()> {
 					json!({"jsonrpc": "2.0", "id": id, "result": config::mining_fee() })
 				},
 				"submitBlock" => {
-					let coins = data["coins"].as_str().unwrap_or("1000");
 					let miner = data["miner"].as_str().unwrap_or("");
 					let nonce = data["nonce"].as_str().unwrap_or("0000000000000000");
 					let ip_str = addr.map(|a| a.ip().to_string());
 
-					match mine_block(coins, miner, nonce, id, "") {
+					match mine_block(miner, nonce, id, "", None) {
 						Ok(_) => {
 							json!({"jsonrpc": "2.0", "id": id, "result": "ok"})
 						}
@@ -1058,11 +1303,10 @@ async fn main() -> sled::Result<()> {
 					}
 				},
 				"submitMergedBlock" => {
-					let coins = "50";
 					let miner = data["params"]["miner"].as_str().unwrap_or("");
 					let nonce = data["params"]["nonce"].as_str().unwrap_or("00000000");
 					let extra_data = data["params"]["extra_data"].as_str().unwrap_or("");
-					match mine_block(coins, miner, nonce, id, extra_data) {
+					match mine_block( miner, nonce, id, extra_data, None) {
 						Ok(_) => {
 							json!({"jsonrpc": "2.0", "id": id, "result": "ok"})
 						}
@@ -1116,7 +1360,7 @@ async fn main() -> sled::Result<()> {
 			warp::reply::json(&response)
 			
 			
-		}).with(warp::compression::gzip());
+		});
 
 	let routes = rpc_route.or(mining_route);
 	warp::serve(routes).run(([0, 0, 0, 0], 40404)).await;

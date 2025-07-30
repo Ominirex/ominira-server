@@ -100,7 +100,7 @@ pub fn start_nng_server(ips: Vec<String>) {
 
 									let payload = json!({
 										"jsonrpc": "2.0",
-										"method": "eth_sendRawTransaction",
+										"method": "pokio_sendRawTransaction",
 										"params": [tx_value_str.clone()],
 										"id": "mempool_auto"
 									});
