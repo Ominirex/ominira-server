@@ -750,7 +750,6 @@ async fn main() -> sled::Result<()> {
 	});
 	
 	let servers = vec![
-		"node1.ominirex.xyz".to_string(),
 		"node2.ominirex.xyz".to_string(),
 		"omi.pokio.xyz".to_string(),
 	];
