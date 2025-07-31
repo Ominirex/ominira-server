@@ -2,6 +2,7 @@ use pqcrypto_sphincsplus::sphincssha2128fsimple::{
     keypair, detached_sign, verify_detached_signature,
     PublicKey, SecretKey, DetachedSignature
 };
+use std::collections::HashSet;
 use pqcrypto_traits::sign::{PublicKey as PublicKeyTrait, SecretKey as SecretKeyTrait };
 use pqcrypto_traits::sign::DetachedSignature as DetachedSignatureTrait;
 use sled;
@@ -517,6 +518,7 @@ fn mine_block(miner: &str, nonce: &str, id: &str, extra_data: &str, rhash: Optio
 		let block_transactions = format!("{}", mining_transaction);
 
 		let db = config::db();
+		let utxodb = config::utxodb();
 		let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
 		let ts_diff = config::ts_diff();
 		let ts_result = now_secs + ts_diff;
@@ -551,17 +553,88 @@ fn mine_block(miner: &str, nonce: &str, id: &str, extra_data: &str, rhash: Optio
 		let mempooldb = config::mempooldb();
 		let mut transactions_list = block_transactions.clone();
 		let mut transactions_hash_list = "".to_string();
+		let mut spent_utxos_in_block: HashSet<String> = HashSet::new();
+		
 		for entry in mempooldb.iter() {
 			match entry {
 				Ok((key, value)) => {
+					if let Err(e) = mempooldb.remove(&key) {
+						eprintln!("Error deleting mempool entry: {:?}", e);
+					}
 					let tx_value_str = String::from_utf8(value.to_vec()).unwrap_or_else(|_| String::from("Invalid UTF-8"));
 					let tx_str = tx_value_str.clone();
 					if db.contains_key(tx_str.clone())? {
        		            continue;
                     }
-					transactions_list = format!("{}-{}", transactions_list, tx_value_str);
-					if let Err(e) = mempooldb.remove(&key) {
-						eprintln!("Error deleting mempool entry: {:?}", e);
+					
+					if let Ok(tx_bytes) = hex::decode(&tx_value_str) {
+						if let Ok(raw_tx) = bincode::deserialize::<RawTransaction>(&tx_bytes) {
+							let rtx = RawTransaction {
+								inputcount: raw_tx.inputcount,
+								inputs: raw_tx.inputs.clone(),
+								outputcount: raw_tx.outputcount,
+								outputs: raw_tx.outputs.clone(),
+								fee: raw_tx.fee,
+								sigpub: raw_tx.sigpub.clone(),
+								signature: "".to_string(),
+							};
+										
+							let mut total_inputs_amount = 0u64;
+							let total_outputs_amount: u64 = raw_tx.outputs.iter().map(|(_, amount)| amount).sum();
+							let mut required_amount = total_outputs_amount + raw_tx.fee;
+										
+							let tx_binary = bincode::serialize(&rtx).expect("Failed to serialize transaction");
+							let tx_hash = blake3::hash(&tx_binary);
+										
+							let bytes_decoded_signature = hex::decode(&raw_tx.signature).expect("Error decoding signature");
+							let decoded_signature = <pqcrypto_sphincsplus::sphincssha2128fsimple::DetachedSignature as DetachedSignatureTrait>::from_bytes(&bytes_decoded_signature)
+								.expect("Error in signature reconstruction");
+										
+							let pk_bytes = hex::decode(&raw_tx.sigpub).expect("Invalid pubkey");
+							let pk = PublicKey::from_bytes(&pk_bytes).expect("Invalid pubkey format");
+										
+							let address_hash = blake3::hash(pk.as_bytes());
+							let sender_address = hex::encode(address_hash.as_bytes());
+
+							match verify_detached_signature(&decoded_signature, tx_hash.as_bytes(), &pk) {
+								Ok(_) => print_log_message(format!("TX received with valid key pair"), 2),
+								Err(e) => {
+									print_log_message(format!("TX received with error: Private and public keys don't form a valid pair"), 2);
+									print_log_message(format!("Details: {}", e), 3);
+									required_amount = 9999999999999999;
+								}
+							}
+										
+							for input in &raw_tx.inputs {
+								let utxokey = format!("{}:{}", input.txid, input.vout);
+								
+								if spent_utxos_in_block.contains(&utxokey) {
+									required_amount = 9999999999999999;
+									break;
+								}
+								
+								if let Ok(Some(utxo_bytes)) = utxodb.get(&utxokey) {
+									let utxo_value: serde_json::Value = serde_json::from_slice(&utxo_bytes).expect("Failed to parse UTXO JSON");
+									let amount = utxo_value["amount"].as_u64().expect("Invalid amount in UTXO");
+									let owner = utxo_value["address"].as_str().expect("Invalid amount in UTXO");
+									if owner != sender_address {
+										required_amount = 9999999999999999;
+										break;
+									}
+									total_inputs_amount += amount;
+									spent_utxos_in_block.insert(utxokey);
+								} else {
+									required_amount = 9999999999999999;
+									break;
+								}
+							}
+										
+							if total_inputs_amount >= required_amount {
+								transactions_list = format!("{}-{}", transactions_list, tx_value_str);
+							} else {
+								print_log_message(format!("Wrong TX deleted from system"), 3);
+							}
+						}
 					}
 				}
 				Err(e) => {
@@ -750,6 +823,7 @@ async fn main() -> sled::Result<()> {
 	});
 	
 	let servers = vec![
+		"node1.ominirex.xyz".to_string(),
 		"node2.ominirex.xyz".to_string(),
 		"omi.pokio.xyz".to_string(),
 	];
@@ -1306,7 +1380,7 @@ async fn main() -> sled::Result<()> {
 						}
 					}
 				},
-				"submitMergedBlock" => {
+				/*"submitMergedBlock" => {
 					let miner = data["params"]["miner"].as_str().unwrap_or("");
 					let nonce = data["params"]["nonce"].as_str().unwrap_or("00000000");
 					let extra_data = data["params"]["extra_data"].as_str().unwrap_or("");
@@ -1318,7 +1392,7 @@ async fn main() -> sled::Result<()> {
 							json!({"jsonrpc": "2.0", "id": id, "result": "ok"})
 						}
 					}
-				},
+				},*/
 				"putBlock" => {
 					match serde_json::from_value::<String>(data["block"].clone()) {
 						Ok(block_str) => {
