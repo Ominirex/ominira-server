@@ -137,15 +137,16 @@ pub fn keccak256(data: &str) -> String {
 
 pub fn calculate_reward(height: u64) -> u64 {
     if height == 1 {
-        10000000000000
-    } else if height > 1 && height < 4200000 {
-        1000000000
-    } else if height >= 4200000 && height < 8400000 {
-        5000000000
-    } else if height >= 8400000 && height < 12600000 {
-        2500000000
+        10_000_000_000_000
     } else {
-        10000000
+        let base_reward: i64 = 1_000_000_000;
+        let intervals = (height / 262_800) as i64;
+        let reduced_reward = base_reward - (intervals * 50_000_000);
+        if reduced_reward > 0 {
+            reduced_reward as u64
+        } else {
+            0
+        }
     }
 }
 
