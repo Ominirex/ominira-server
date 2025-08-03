@@ -137,18 +137,32 @@ pub fn keccak256(data: &str) -> String {
 
 pub fn calculate_reward(height: u64) -> u64 {
     if height == 1 {
-        10_000_000_000_000
+        return 10_000_000_000_000; // Premined block
+    }
+
+    let blocks_per_year = 262_800;
+    let year = height / blocks_per_year;
+    let mut reward: f64;
+
+    if year == 0 {
+        reward = 10.0;
+    } else if year == 1 {
+        reward = 9.0;
+    } else if year == 2 {
+        reward = 8.0;
+    } else if year == 3 {
+        reward = 7.0;
     } else {
-        let base_reward: i64 = 1_000_000_000;
-        let intervals = (height / 262_800) as i64;
-        let reduced_reward = base_reward - (intervals * 50_000_000);
-        if reduced_reward > 0 {
-            reduced_reward as u64
-        } else {
-            0
-        }
+        reward = 7.0 - 0.5 * ((year - 3) as f64);
+    }
+
+    if reward < 0.0 {
+        0
+    } else {
+        (reward * 100_000_000.0).round() as u64
     }
 }
+
 
 pub fn calculate_rx_diff(height: u64) -> u64 {
 	if height <= 17 {
