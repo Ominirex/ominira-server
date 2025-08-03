@@ -156,8 +156,8 @@ pub fn calculate_reward(height: u64) -> u64 {
         reward = 7.0 - 0.5 * ((year - 3) as f64);
     }
 
-    if reward < 0.0 {
-        0
+    if reward <= 0.0 {
+        10_000_000
     } else {
         (reward * 100_000_000.0).round() as u64
     }
